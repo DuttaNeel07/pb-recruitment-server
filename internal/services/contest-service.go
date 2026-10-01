@@ -130,8 +130,9 @@ func (cs *ContestService) CreateProblem(ctx context.Context, contestID string, r
 
 		for i, tc := range req.Testcases {
 			tcArray = append(tcArray, map[string]interface{}{
-				"index": i,
-				"input": tc.Input,
+				"index":     i,
+				"input":     tc.Input,
+				"is_sample": tc.IsSample,
 			})
 
 			ansArray = append(ansArray, tc.ExpectedOutput)
@@ -196,8 +197,9 @@ func (cs *ContestService) UpdateProblem(ctx context.Context, contestID string, p
 
 		for i, tc := range req.Testcases {
 			tcArray = append(tcArray, map[string]interface{}{
-				"index": i,
-				"input": tc.Input,
+				"index":     i,
+				"input":     tc.Input,
+				"is_sample": tc.IsSample,
 			})
 
 			ansArray = append(ansArray, tc.ExpectedOutput)
@@ -313,7 +315,7 @@ func (cs *ContestService) GetContestProblem(ctx context.Context, contestID strin
 		}
 		meta.Description = desc
 	}
-	if includeAdminFields && meta.Type == models.Code && meta.TestcasesKey != "" {
+	if meta.Type == models.Code && meta.TestcasesKey != "" {
 		// ponytail: testcases are secondary data. A missing or corrupt object must not
 		// take the problem statement down with it -- log and serve the statement.
 		if testcase, err := cs.s3.GetObject(ctx, meta.TestcasesKey); err != nil {
@@ -323,7 +325,37 @@ func (cs *ContestService) GetContestProblem(ctx context.Context, contestID strin
 			if err := json.Unmarshal([]byte(testcase), &tcArr); err != nil {
 				log.Errorf("failed to parse testcases for problem %s: %v", problemID, err)
 			} else {
-				meta.Testcases = tcArr
+				if includeAdminFields {
+					meta.Testcases = tcArr
+				} else {
+					sampleCases := []dto.TestCaseResponse{}
+					for _, tc := range tcArr {
+						if tc.IsSample {
+							sampleCases = append(sampleCases, tc)
+						}
+					}
+					// A sample is only useful if the contestant can see the expected
+					// output, which lives in answers.json. Hidden cases keep theirs
+					// server-side.
+					if len(sampleCases) > 0 {
+						answersKey := fmt.Sprintf("problems/%s/%s/answers.json", contestID, problemID)
+						if raw, err := cs.s3.GetObject(ctx, answersKey); err != nil {
+							log.Errorf("failed to load answers for problem %s: %v", problemID, err)
+						} else {
+							var answers []string
+							if err := json.Unmarshal([]byte(raw), &answers); err != nil {
+								log.Errorf("failed to parse answers for problem %s: %v", problemID, err)
+							} else {
+								for i, tc := range sampleCases {
+									if tc.Index >= 0 && tc.Index < len(answers) {
+										sampleCases[i].ExpectedOutput = answers[tc.Index]
+									}
+								}
+							}
+						}
+					}
+					meta.Testcases = sampleCases
+				}
 			}
 		}
 	}
