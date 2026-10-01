@@ -102,6 +102,7 @@ func (cs *ContestService) CreateProblem(ctx context.Context, contestID string, r
 		Score:              req.Score,
 		Type:               req.Type,
 		Answer:             req.Answer,
+		Options:            req.Options,
 		HasMultipleAnswers: req.Type == "mcq" && len(req.Answer) > 1,
 	}
 
@@ -223,6 +224,7 @@ func (cs *ContestService) UpdateProblem(ctx context.Context, contestID string, p
 		Score:              req.Score,
 		Type:               req.Type,
 		Answer:             req.Answer,
+		Options:            req.Options,
 		HasMultipleAnswers: hasMultiple,
 		Testcases:          testcasesKey,
 	}
@@ -291,7 +293,7 @@ func (cs *ContestService) GetContestProblemsListAdmin(ctx context.Context, conte
 	return cs.stores.Problems.GetProblemList(ctx, contestID)
 }
 
-func (cs *ContestService) GetContestProblem(ctx context.Context, contestID string, problemID string, includeTestcases bool) (*dto.GetProblemStatementResponse, error) {
+func (cs *ContestService) GetContestProblem(ctx context.Context, contestID string, problemID string, includeAdminFields bool) (*dto.GetProblemStatementResponse, error) {
 
 	meta, err := cs.stores.Problems.GetProblem(ctx, problemID, contestID)
 	if err != nil {
@@ -307,7 +309,7 @@ func (cs *ContestService) GetContestProblem(ctx context.Context, contestID strin
 		}
 		meta.Description = desc
 	}
-	if includeTestcases && meta.Type == models.Code && meta.TestcasesKey != "" {
+	if includeAdminFields && meta.Type == models.Code && meta.TestcasesKey != "" {
 		// ponytail: testcases are secondary data. A missing or corrupt object must not
 		// take the problem statement down with it -- log and serve the statement.
 		if testcase, err := cs.s3.GetObject(ctx, meta.TestcasesKey); err != nil {
@@ -320,6 +322,9 @@ func (cs *ContestService) GetContestProblem(ctx context.Context, contestID strin
 				meta.Testcases = tcArr
 			}
 		}
+	}
+	if !includeAdminFields {
+		meta.Answer = nil
 	}
 
 	return meta, nil
