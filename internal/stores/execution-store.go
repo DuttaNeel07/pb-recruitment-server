@@ -1,0 +1,90 @@
+package stores
+
+import (
+	"app/internal/models"
+	"context"
+	"database/sql"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/lib/pq"
+)
+
+type ExecutionStore struct {
+	db *sql.DB
+}
+
+func NewExecutionStore(db *sql.DB) *ExecutionStore {
+	return &ExecutionStore{db: db}
+}
+
+func (s *ExecutionStore) InsertBatch(ctx context.Context, submissionID string, indexes []int) ([]models.Execution, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("execution store: db is not initialized")
+	}
+	if len(indexes) == 0 {
+		return []models.Execution{}, nil
+	}
+
+	now := time.Now().Unix()
+	executions := make([]models.Execution, len(indexes))
+	ids := make([]string, len(indexes))
+	created := make([]int64, len(indexes))
+
+	for i, idx := range indexes {
+		id := uuid.NewString()
+		ids[i] = id
+		created[i] = now
+		executions[i] = models.Execution{
+			ID:            id,
+			SubmissionID:  submissionID,
+			TestCaseIndex: idx,
+			Status:        "pending",
+			CreatedAt:     now,
+		}
+	}
+
+	const q = `
+		INSERT INTO submission_executions (id, submission_id, test_case_index, status, created_at)
+		SELECT unnest($1::uuid[]), $2, unnest($3::int[]), 'pending', unnest($4::bigint[])
+	`
+
+	_, err := s.db.ExecContext(ctx, q, pq.Array(ids), submissionID, pq.Array(indexes), pq.Array(created))
+	if err != nil {
+		return nil, fmt.Errorf("insert executions: %w", err)
+	}
+
+	return executions, nil
+}
+
+func (s *ExecutionStore) SaveTokens(ctx context.Context, tokens map[string]string) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("execution store: db is not initialized")
+	}
+	if len(tokens) == 0 {
+		return nil
+	}
+
+	ids := make([]string, 0, len(tokens))
+	values := make([]string, 0, len(tokens))
+	for id, token := range tokens {
+		ids = append(ids, id)
+		values = append(values, token)
+	}
+
+	const q = `
+		UPDATE submission_executions AS e
+		SET judge0_token = data.token
+		FROM (
+			SELECT unnest($1::uuid[]) AS id, unnest($2::text[]) AS token
+		) AS data
+		WHERE e.id = data.id
+	`
+
+	_, err := s.db.ExecContext(ctx, q, pq.Array(ids), pq.Array(values))
+	if err != nil {
+		return fmt.Errorf("save judge0 tokens: %w", err)
+	}
+	return nil
+}

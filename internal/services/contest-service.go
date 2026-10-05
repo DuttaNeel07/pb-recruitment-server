@@ -104,6 +104,8 @@ func (cs *ContestService) CreateProblem(ctx context.Context, contestID string, r
 		Answer:             req.Answer,
 		Options:            req.Options,
 		HasMultipleAnswers: req.Type == "mcq" && len(req.Answer) > 1,
+		TimeLimit:   req.TimeLimit,
+		MemoryLimit: req.MemoryLimit,
 	}
 
 	s3Key := fmt.Sprintf("problems/%s/%s/description.json", contestID, problem.ID)
@@ -150,6 +152,10 @@ func (cs *ContestService) CreateProblem(ctx context.Context, contestID string, r
 		}
 
 		problem.Testcases = testcasesKey
+	}
+
+	if problem.Options == nil {
+		problem.Options = []string{}
 	}
 
 	if err := cs.stores.Problems.CreateProblem(ctx, problem); err != nil {
@@ -229,11 +235,18 @@ func (cs *ContestService) UpdateProblem(ctx context.Context, contestID string, p
 		Options:            req.Options,
 		HasMultipleAnswers: hasMultiple,
 		Testcases:          testcasesKey,
+		TimeLimit:   req.TimeLimit,
+		MemoryLimit: req.MemoryLimit,
 	}
 
-	if err := cs.stores.Problems.UpdateProblem(ctx, problem); err != nil {
+	if problem.Options == nil {
+		problem.Options = []string{}
+	}
+
+	if err := cs.stores.Problems.CreateProblem(ctx, problem); err != nil {
 		return nil, err
 	}
+
 	return problem, nil
 }
 

@@ -119,6 +119,9 @@ func (sc *SubmissionController) SubmitSolution(ctx echo.Context) error {
 		if errors.Is(err, common.KeyAlreadyExistsError) {
 			return ctx.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
 		}
+		if errors.Is(err, common.ErrUnsupportedLanguage) || errors.Is(err, common.ErrNoTestcases) || errors.Is(err, common.ErrInvalidCode) {
+			return ctx.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
 		return ctx.NoContent(http.StatusInternalServerError)
 	}
 
