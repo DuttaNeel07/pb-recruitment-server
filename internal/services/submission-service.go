@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 )
 
@@ -136,23 +137,46 @@ func (ss *SubmissionService) CreateSubmission(ctx context.Context, userID string
 		}
 	}
 
-	results, err := ss.judge0.CreateBatch(ctx, jobs)
-	if err != nil {
-		return submissionID, nil
-	}
+	results, batchErr := ss.judge0.CreateBatch(ctx, jobs)
 
 	tokens := map[string]string{}
-	for i, result := range results {
-		if result.Error != nil || result.Token == "" {
-			continue
+	failedIDs := []string{}
+
+	if batchErr != nil {
+		log.Printf("judge0 batch failed for submission %s: %v", submissionID, batchErr)
+		for _, exec := range executions {
+			failedIDs = append(failedIDs, exec.ID)
 		}
-		tokens[executions[i].ID] = result.Token
+	} else {
+		for i, result := range results {
+			if result.Error != nil || result.Token == "" {
+				failedIDs = append(failedIDs, executions[i].ID)
+				continue
+			}
+			tokens[executions[i].ID] = result.Token
+		}
 	}
+
 	if len(tokens) > 0 {
-		_ = ss.stores.Executions.SaveTokens(ctx, tokens)
+		if err := ss.stores.Executions.SaveTokens(ctx, tokens); err != nil {
+			log.Printf("save tokens failed for submission %s: %v", submissionID, err)
+			if err := ss.stores.Executions.SaveTokens(ctx, tokens); err != nil {
+				log.Printf("save tokens retry failed for submission %s: %v", submissionID, err)
+				for id := range tokens {
+					failedIDs = append(failedIDs, id)
+				}
+			}
+		}
+	}
+
+	if len(failedIDs) > 0 {
+		if err := ss.stores.Executions.MarkFailed(ctx, failedIDs); err != nil {
+			log.Printf("mark failed executions failed for submission %s: %v", submissionID, err)
+		}
 	}
 
 	return submissionID, nil
+
 }
 
 func (ss *SubmissionService) loadTestcases(ctx context.Context, contestID, problemID, testcasesKey string) ([]string, []string, error) {

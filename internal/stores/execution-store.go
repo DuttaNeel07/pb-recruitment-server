@@ -88,3 +88,23 @@ func (s *ExecutionStore) SaveTokens(ctx context.Context, tokens map[string]strin
 	}
 	return nil
 }
+
+func (s *ExecutionStore) MarkFailed(ctx context.Context, ids []string) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("execution store: db is not initialized")
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	const q = `
+		UPDATE submission_executions
+		SET status = 'failed_to_process'
+		WHERE id = ANY($1::uuid[])
+		  AND judge0_token IS NULL
+	`
+	_, err := s.db.ExecContext(ctx, q, pq.Array(ids))
+	if err != nil {
+		return fmt.Errorf("mark executions failed: %w", err)
+	}
+	return nil 
+}
