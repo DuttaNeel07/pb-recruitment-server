@@ -136,8 +136,10 @@ func (ss *SubmissionService) CreateSubmission(ctx context.Context, userID string
 			CallbackURL:    ss.judge0.CallbackURL(exec.ID),
 		}
 	}
+	dispatchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ss.judge0.Timeout())
+	defer cancel()
 
-	results, batchErr := ss.judge0.CreateBatch(ctx, jobs)
+	results, batchErr := ss.judge0.CreateBatch(dispatchCtx, jobs)
 
 	tokens := map[string]string{}
 	failedIDs := []string{}
@@ -158,7 +160,7 @@ func (ss *SubmissionService) CreateSubmission(ctx context.Context, userID string
 	}
 
 	if len(tokens) > 0 {
-		if err := ss.stores.Executions.SaveTokens(ctx, tokens); err != nil {
+		if err := ss.stores.Executions.SaveTokens(dispatchCtx, tokens); err != nil {
 			log.Printf("save tokens failed for submission %s: %v", submissionID, err)
 			if err := ss.stores.Executions.SaveTokens(ctx, tokens); err != nil {
 				log.Printf("save tokens retry failed for submission %s: %v", submissionID, err)
@@ -170,7 +172,7 @@ func (ss *SubmissionService) CreateSubmission(ctx context.Context, userID string
 	}
 
 	if len(failedIDs) > 0 {
-		if err := ss.stores.Executions.MarkFailed(ctx, failedIDs); err != nil {
+		if err := ss.stores.Executions.MarkFailed(dispatchCtx, failedIDs); err != nil {
 			log.Printf("mark failed executions failed for submission %s: %v", submissionID, err)
 		}
 	}

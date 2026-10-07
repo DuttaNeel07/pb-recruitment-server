@@ -37,6 +37,13 @@ func NewClient() *Client {
 	}
 }
 
+func (c *Client) Timeout() time.Duration {
+	if c == nil || c.httpClient == nil || c.httpClient.Timeout <= 0 {
+		return 30 * time.Second
+	}
+	return c.httpClient.Timeout
+}
+
 func (c *Client) CallbackURL(executionID string) string {
 	if c.callbackBase == "" {
 		return ""
