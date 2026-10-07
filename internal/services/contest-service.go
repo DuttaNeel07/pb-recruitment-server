@@ -243,7 +243,7 @@ func (cs *ContestService) UpdateProblem(ctx context.Context, contestID string, p
 		problem.Options = []string{}
 	}
 
-	if err := cs.stores.Problems.CreateProblem(ctx, problem); err != nil {
+	if err := cs.stores.Problems.UpdateProblem(ctx, problem); err != nil {
 		return nil, err
 	}
 
