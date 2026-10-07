@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -43,6 +44,19 @@ func (c *Client) CallbackURL(executionID string) string {
 	return fmt.Sprintf("%s/internal/judge0/callback/%s", c.callbackBase, executionID)
 }
 
+func (c *Client) batchSize() int {
+	const defaultSize = 20
+	raw := os.Getenv("JUDGE0_BATCH_SIZE")
+	if raw == "" {
+		return defaultSize
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return defaultSize
+	}
+	return n
+}
+
 func (c *Client) CreateBatch(ctx context.Context, jobs []SubmissionRequest) ([]SubmissionResult, error) {
 	if c.baseURL == "" {
 		return nil, fmt.Errorf("%w: JUDGE0_URL is not set", ErrUnavailable)
@@ -51,6 +65,33 @@ func (c *Client) CreateBatch(ctx context.Context, jobs []SubmissionRequest) ([]S
 		return []SubmissionResult{}, nil
 	}
 
+	results := make([]SubmissionResult, len(jobs))
+	size := c.batchSize()
+
+	for start := 0; start < len(jobs); start += size {
+		end := start + size
+		if end > len(jobs) {
+			end = len(jobs)
+		}
+		chunk := jobs[start:end]
+
+		chunkResults, err := c.postBatch(ctx, chunk)
+		if err != nil {
+			for i := start; i < len(jobs); i++ {
+				if results[i].Token == "" && results[i].Error == nil {
+					results[i] = SubmissionResult{Error: err}
+				}
+			}
+			return results, err
+		}
+
+		copy(results[start:end], chunkResults)
+	}
+
+	return results, nil
+}
+
+func (c *Client) postBatch(ctx context.Context, jobs []SubmissionRequest) ([]SubmissionResult, error) {
 	payload, err := json.Marshal(map[string][]SubmissionRequest{
 		"submissions": jobs,
 	})
@@ -89,16 +130,11 @@ func (c *Client) CreateBatch(ctx context.Context, jobs []SubmissionRequest) ([]S
 
 	results := make([]SubmissionResult, len(jobs))
 	for i := range jobs {
-		if i >= len(tokens) {
-			results[i] = SubmissionResult{Error: ErrInvalidResponse}
-			continue
-		}
-		if tokens[i].Token == "" {
+		if i >= len(tokens) || tokens[i].Token == "" {
 			results[i] = SubmissionResult{Error: ErrInvalidResponse}
 			continue
 		}
 		results[i] = SubmissionResult{Token: tokens[i].Token}
 	}
-
 	return results, nil
 }
