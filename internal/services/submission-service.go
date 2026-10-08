@@ -10,9 +10,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
 	"strings"
+	"time"
+
+	"github.com/labstack/gommon/log"
 )
 
 type SubmissionService struct {
@@ -124,56 +127,46 @@ func (ss *SubmissionService) CreateSubmission(ctx context.Context, userID string
 		memLimit = 256 * 1024
 	}
 
+	compilerOptions := judge0.CompilerOptions(languageID)
 	jobs := make([]judge0.SubmissionRequest, len(executions))
 	for i, exec := range executions {
 		jobs[i] = judge0.SubmissionRequest{
-			SourceCode:     source,
-			LanguageID:     languageID,
-			Stdin:          inputs[i],
-			ExpectedOutput: outputs[i],
-			CPUTimeLimit:   cpuLimit,
-			MemoryLimit:    memLimit,
-			CallbackURL:    ss.judge0.CallbackURL(exec.ID),
+			SourceCode:      source,
+			LanguageID:      languageID,
+			Stdin:           inputs[i],
+			ExpectedOutput:  outputs[i],
+			CPUTimeLimit:    cpuLimit,
+			MemoryLimit:     memLimit,
+			CallbackURL:     ss.judge0.CallbackURL(exec.ID),
+			CompilerOptions: compilerOptions,
 		}
 	}
-	dispatchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ss.judge0.Timeout())
-	defer cancel()
 
-	results, batchErr := ss.judge0.CreateBatch(dispatchCtx, jobs)
+	dispatchCtx, cancelDispatch := context.WithTimeout(context.WithoutCancel(ctx), ss.judge0.Timeout())
+	defer cancelDispatch()
 
-	tokens := map[string]string{}
-	failedIDs := []string{}
-
-	if batchErr != nil {
-		log.Printf("judge0 batch failed for submission %s: %v", submissionID, batchErr)
-		for _, exec := range executions {
-			failedIDs = append(failedIDs, exec.ID)
-		}
-	} else {
-		for i, result := range results {
-			if result.Error != nil || result.Token == "" {
-				failedIDs = append(failedIDs, executions[i].ID)
-				continue
-			}
-			tokens[executions[i].ID] = result.Token
-		}
+	results, err := ss.judge0.CreateBatch(dispatchCtx, jobs)
+	if err != nil {
+		log.Errorf("judge0 batch failed for submission %s: %v", submissionID, err)
 	}
+
+	tokens, failedIDs := classifyDispatchResults(executions, results)
+
+	dbCtx, cancelDB := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancelDB()
 
 	if len(tokens) > 0 {
-		if err := ss.stores.Executions.SaveTokens(dispatchCtx, tokens); err != nil {
-			log.Printf("save tokens failed for submission %s: %v", submissionID, err)
-			if err := ss.stores.Executions.SaveTokens(ctx, tokens); err != nil {
-				log.Printf("save tokens retry failed for submission %s: %v", submissionID, err)
-				for id := range tokens {
-					failedIDs = append(failedIDs, id)
-				}
+		if saveErr := ss.stores.Executions.SaveTokens(dbCtx, tokens); saveErr != nil {
+			log.Errorf("save judge0 tokens for submission %s: %v", submissionID, saveErr)
+			for id := range tokens {
+				failedIDs = append(failedIDs, id)
 			}
 		}
 	}
 
 	if len(failedIDs) > 0 {
-		if err := ss.stores.Executions.MarkFailed(dispatchCtx, failedIDs); err != nil {
-			log.Printf("mark failed executions failed for submission %s: %v", submissionID, err)
+		if markErr := ss.stores.Executions.MarkFailed(dbCtx, failedIDs); markErr != nil {
+			log.Errorf("mark failed executions for submission %s: %v", submissionID, markErr)
 		}
 	}
 
@@ -189,11 +182,11 @@ func (ss *SubmissionService) loadTestcases(ctx context.Context, contestID, probl
 
 	tcRaw, err := ss.s3.GetObject(ctx, testcasesKey)
 	if err != nil {
-		return nil, nil, common.ErrNoTestcases
+		return nil, nil, mapObjectReadError(err)
 	}
 	ansRaw, err := ss.s3.GetObject(ctx, answersKey)
 	if err != nil {
-		return nil, nil, common.ErrNoTestcases
+		return nil, nil, mapObjectReadError(err)
 	}
 
 	var cases []struct {
@@ -235,4 +228,24 @@ func decodeSource(code string) (string, error) {
 		return code, nil
 	}
 	return string(decoded), nil
+}
+
+func classifyDispatchResults(executions []models.Execution, results []judge0.SubmissionResult) (map[string]string, []string) {
+	tokens := map[string]string{}
+	failedIDs := make([]string, 0)
+	for i, exec := range executions {
+		if i < len(results) && results[i].Error == nil && results[i].Token != "" {
+			tokens[exec.ID] = results[i].Token
+		} else {
+			failedIDs = append(failedIDs, exec.ID)
+		}
+	}
+	return tokens, failedIDs
+}
+
+func mapObjectReadError(err error) error {
+	if errors.Is(err, common.KeyNotFoundError) {
+		return common.ErrNoTestcases
+	}
+	return err
 }

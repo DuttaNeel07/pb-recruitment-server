@@ -96,15 +96,31 @@ func (s *ExecutionStore) MarkFailed(ctx context.Context, ids []string) error {
 	if len(ids) == 0 {
 		return nil
 	}
+
 	const q = `
-		UPDATE submission_executions
+		WITH failed AS (
+			UPDATE submission_executions
+			SET status = 'failed_to_process'
+			WHERE id = ANY($1::uuid[])
+			  AND judge0_token IS NULL
+			RETURNING submission_id, id
+		)
+		UPDATE submissions
 		SET status = 'failed_to_process'
-		WHERE id = ANY($1::uuid[])
-		  AND judge0_token IS NULL
+		WHERE id IN (SELECT submission_id FROM failed)
+		  AND status = 'pending'
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM submission_executions e
+			WHERE e.submission_id = submissions.id
+			  AND e.id NOT IN (SELECT id FROM failed)
+			  AND (e.status = 'pending' OR e.judge0_token IS NOT NULL)
+		  )
 	`
+
 	_, err := s.db.ExecContext(ctx, q, pq.Array(ids))
 	if err != nil {
-		return fmt.Errorf("mark executions failed: %w", err)
+		return fmt.Errorf("mark failed executions: %w", err)
 	}
-	return nil 
+	return nil
 }

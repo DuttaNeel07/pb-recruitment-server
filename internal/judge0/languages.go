@@ -20,3 +20,9 @@ func LanguageID(language string) (int, error) {
 		return 0, ErrUnsupportedLanguage
 	}
 }
+func CompilerOptions(languageID int) string {
+	if languageID == 54 {
+		return "-std=c++17"
+	}
+	return ""
+}
