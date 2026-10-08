@@ -165,8 +165,11 @@ func (ss *SubmissionService) CreateSubmission(ctx context.Context, userID string
 	}
 
 	if len(failedIDs) > 0 {
-		if markErr := ss.stores.Executions.MarkFailed(dbCtx, failedIDs); markErr != nil {
+		failureCtx, cancelFailure := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancelFailure()
+		if markErr := ss.stores.Executions.MarkFailed(failureCtx, failedIDs); markErr != nil {
 			log.Errorf("mark failed executions for submission %s: %v", submissionID, markErr)
+			return "", markErr
 		}
 	}
 
