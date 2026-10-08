@@ -100,13 +100,13 @@ func (s *ExecutionStore) MarkFailed(ctx context.Context, ids []string) error {
 	const q = `
 		WITH failed AS (
 			UPDATE submission_executions
-			SET status = 'failed_to_process'
+			SET status = 'judge_error'
 			WHERE id = ANY($1::uuid[])
 			  AND judge0_token IS NULL
 			RETURNING submission_id, id
 		)
 		UPDATE submissions
-		SET status = 'failed_to_process'
+		SET status = 'judge_error'
 		WHERE id IN (SELECT submission_id FROM failed)
 		  AND status = 'pending'
 		  AND NOT EXISTS (

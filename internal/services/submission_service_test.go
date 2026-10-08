@@ -13,12 +13,20 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
-type submissionTestStore struct{ *stores.SubmissionStore }
+type submissionTestStore struct {
+	*stores.SubmissionStore
+	markFailed func(context.Context, string) error
+}
 
 func (submissionTestStore) CreateSubmission(context.Context, *models.Submission) (string, error) {
 	return "submission", nil
+}
+
+func (s submissionTestStore) MarkFailed(ctx context.Context, id string) error {
+	return s.markFailed(ctx, id)
 }
 
 type problemTestStore struct{ *stores.ProblemStore }
@@ -29,11 +37,17 @@ func (problemTestStore) GetProblem(context.Context, string, string) (*dto.GetPro
 
 type executionTestStore struct {
 	*stores.ExecutionStore
-	saveTokens func(context.Context, map[string]string) error
-	markFailed func(context.Context, []string) error
+	saveTokens  func(context.Context, map[string]string) error
+	markFailed  func(context.Context, []string) error
+	insertBatch func(context.Context) error
 }
 
-func (executionTestStore) InsertBatch(context.Context, string, []int) ([]models.Execution, error) {
+func (s executionTestStore) InsertBatch(ctx context.Context, _ string, _ []int) ([]models.Execution, error) {
+	if s.insertBatch != nil {
+		if err := s.insertBatch(ctx); err != nil {
+			return nil, err
+		}
+	}
 	return []models.Execution{{ID: "execution"}}, nil
 }
 
@@ -51,14 +65,25 @@ func TestCreateSubmissionFailureBookkeeping(t *testing.T) {
 		name        string
 		timeoutSave bool
 		markErr     error
+		failUpload  bool
+		failInsert  bool
 	}{
 		{name: "token save timeout", timeoutSave: true},
 		{name: "failure status write error", markErr: writeErr},
+		{name: "code upload failure", failUpload: true},
+		{name: "execution insertion failure", failInsert: true},
+		{name: "preparation cleanup failure", failInsert: true, markErr: writeErr},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			objects := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == http.MethodPut {
-					w.WriteHeader(http.StatusOK)
+					if tc.failUpload {
+						w.Header().Set("Content-Type", "application/xml")
+						w.WriteHeader(http.StatusForbidden)
+						w.Write([]byte(`<Error><Code>AccessDenied</Code></Error>`))
+					} else {
+						w.WriteHeader(http.StatusOK)
+					}
 				} else if strings.HasSuffix(r.URL.Path, "testcases.json") {
 					w.Write([]byte(`[{"index":0,"input":"1"}]`))
 				} else {
@@ -75,6 +100,9 @@ func TestCreateSubmissionFailureBookkeeping(t *testing.T) {
 				t.Setenv(key, value)
 			}
 			judge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tc.failUpload || tc.failInsert {
+					t.Error("dispatch must not run after preparation failure")
+				}
 				if tc.timeoutSave {
 					w.WriteHeader(http.StatusCreated)
 					w.Write([]byte(`[{"token":"token"}]`))
@@ -92,9 +120,41 @@ func TestCreateSubmissionFailureBookkeeping(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			marked := false
+			checkContext := func(ctx context.Context) error {
+				if err := ctx.Err(); err != nil {
+					t.Errorf("failure bookkeeping received expired context: %v", err)
+					return err
+				}
+				if _, bounded := ctx.Deadline(); !bounded {
+					t.Error("failure bookkeeping needs a bounded context")
+				}
+				return nil
+			}
 			store := &stores.Storage{
-				Submissions: submissionTestStore{}, Problems: problemTestStore{},
+				Submissions: submissionTestStore{markFailed: func(ctx context.Context, id string) error {
+					marked = true
+					if !tc.failUpload && !tc.failInsert {
+						t.Error("unexpected parent failure write")
+					}
+					if id != "submission" {
+						t.Errorf("failed submission ID = %q", id)
+					}
+					if err := checkContext(ctx); err != nil {
+						return err
+					}
+					return tc.markErr
+				}}, Problems: problemTestStore{},
 				Executions: executionTestStore{
+					insertBatch: func(ctx context.Context) error {
+						if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > 5*time.Second {
+							t.Error("submission preparation must be bounded to five seconds")
+						}
+						if tc.failInsert {
+							cancel()
+							return context.Canceled
+						}
+						return nil
+					},
 					saveTokens: func(ctx context.Context, tokens map[string]string) error {
 						if !tc.timeoutSave || tokens["execution"] != "token" {
 							t.Fatal("unexpected token save")
@@ -105,12 +165,8 @@ func TestCreateSubmissionFailureBookkeeping(t *testing.T) {
 					},
 					markFailed: func(ctx context.Context, ids []string) error {
 						marked = true
-						if err := ctx.Err(); err != nil {
-							t.Errorf("failure bookkeeping received expired context: %v", err)
+						if err := checkContext(ctx); err != nil {
 							return err
-						}
-						if _, bounded := ctx.Deadline(); !bounded {
-							t.Error("failure bookkeeping needs a bounded context")
 						}
 						if len(ids) != 1 || ids[0] != "execution" {
 							t.Errorf("failed execution IDs = %v", ids)
@@ -127,10 +183,20 @@ func TestCreateSubmissionFailureBookkeeping(t *testing.T) {
 			if !marked {
 				t.Error("failure bookkeeping was not called")
 			}
-			if !errors.Is(err, tc.markErr) {
-				t.Errorf("CreateSubmission error = %v, want %v", err, tc.markErr)
+			if tc.failUpload || tc.failInsert {
+				if err == nil {
+					t.Error("preparation failure must return an error")
+				}
+				if tc.failInsert && !errors.Is(err, context.Canceled) {
+					t.Errorf("lost insertion error: %v", err)
+				}
 			}
-			if tc.markErr == nil && id != "submission" {
+			if tc.markErr != nil || (!tc.failUpload && !tc.failInsert) {
+				if !errors.Is(err, tc.markErr) {
+					t.Errorf("CreateSubmission error = %v, want %v", err, tc.markErr)
+				}
+			}
+			if err == nil && id != "submission" {
 				t.Errorf("submission ID = %q", id)
 			}
 		})

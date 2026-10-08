@@ -59,6 +59,9 @@ func (ss *SubmissionService) ListUserSubmissionsByProblemID(ctx context.Context,
 }
 
 func (ss *SubmissionService) CreateSubmission(ctx context.Context, userID string, submissionType models.SubmissionType, req *dto.SubmitSubmissionRequest) (string, error) {
+	ctx, cancelPreparation := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelPreparation()
+
 	sub := &models.Submission{
 		UserID:    userID,
 		ContestID: req.ContestID,
@@ -105,7 +108,7 @@ func (ss *SubmissionService) CreateSubmission(ctx context.Context, userID string
 	}
 
 	if err := ss.s3.PutObject(ctx, submissionID, req.Code); err != nil {
-		return "", err
+		return "", ss.markSubmissionFailed(ctx, submissionID, err)
 	}
 
 	indexes := make([]int, len(inputs))
@@ -115,7 +118,7 @@ func (ss *SubmissionService) CreateSubmission(ctx context.Context, userID string
 
 	executions, err := ss.stores.Executions.InsertBatch(ctx, submissionID, indexes)
 	if err != nil {
-		return "", err
+		return "", ss.markSubmissionFailed(ctx, submissionID, err)
 	}
 
 	cpuLimit := float64(problem.TimeLimit) / 1000.0
@@ -175,6 +178,16 @@ func (ss *SubmissionService) CreateSubmission(ctx context.Context, userID string
 
 	return submissionID, nil
 
+}
+
+func (ss *SubmissionService) markSubmissionFailed(ctx context.Context, submissionID string, cause error) error {
+	failureCtx, cancelFailure := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancelFailure()
+	if err := ss.stores.Submissions.MarkFailed(failureCtx, submissionID); err != nil {
+		log.Errorf("mark failed submission %s: %v", submissionID, err)
+		return errors.Join(cause, err)
+	}
+	return cause
 }
 
 func (ss *SubmissionService) loadTestcases(ctx context.Context, contestID, problemID, testcasesKey string) ([]string, []string, error) {

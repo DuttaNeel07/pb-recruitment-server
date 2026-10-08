@@ -28,9 +28,9 @@ func NewS3Client() *S3 {
 	}
 
 	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.UsePathStyle = true
 		if endpoint := os.Getenv("AWS_ENDPOINT_URL_S3"); endpoint != "" {
 			o.BaseEndpoint = aws.String(endpoint)
+			o.UsePathStyle = true
 		}
 	})
 

@@ -19,11 +19,14 @@ type Client struct {
 	httpClient   *http.Client
 }
 
+// Dispatch leaves ten seconds for DB bookkeeping within the browser's thirty-second timeout.
+const maxDispatchTimeout = 10 * time.Second
+
 func NewClient() *Client {
-	timeout := 30 * time.Second
+	timeout := maxDispatchTimeout
 	if raw := os.Getenv("JUDGE0_TIMEOUT_MS"); raw != "" {
-		if ms, err := time.ParseDuration(raw + "ms"); err == nil {
-			timeout = ms
+		if ms, err := time.ParseDuration(raw + "ms"); err == nil && ms > 0 {
+			timeout = min(ms, maxDispatchTimeout)
 		}
 	}
 
@@ -39,9 +42,9 @@ func NewClient() *Client {
 
 func (c *Client) Timeout() time.Duration {
 	if c == nil || c.httpClient == nil || c.httpClient.Timeout <= 0 {
-		return 30 * time.Second
+		return maxDispatchTimeout
 	}
-	return c.httpClient.Timeout
+	return min(c.httpClient.Timeout, maxDispatchTimeout)
 }
 
 func (c *Client) CallbackURL(executionID string) string {
