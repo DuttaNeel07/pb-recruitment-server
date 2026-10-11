@@ -12,16 +12,23 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/labstack/gommon/log"
+	"go.uber.org/fx"
 )
 
 type SubmissionService struct {
-	stores *stores.Storage
-	s3     *s3.S3
-	judge0 *judge0.Client
+	stores             *stores.Storage
+	s3                 *s3.S3
+	judge0             *judge0.Client
+	recoveryCursorTime int64
+	recoveryCursorID   string
+	recoveryIdleSince  time.Time
+	cursorMu           sync.Mutex
 }
 
 func NewSubmissionService(stores *stores.Storage, s3 *s3.S3, judge0Client *judge0.Client) *SubmissionService {
@@ -173,10 +180,24 @@ func (ss *SubmissionService) CreateSubmission(ctx context.Context, userID string
 	if len(tokens) > 0 {
 		if saveErr := ss.stores.Executions.SaveTokens(dbCtx, tokens); saveErr != nil {
 			log.Errorf("save judge0 tokens for submission %s: %v", submissionID, saveErr)
-			for id := range tokens {
-				failedIDs = append(failedIDs, id)
+			if !ss.judge0.CallbacksEnabled() {
+				for id := range tokens {
+					failedIDs = append(failedIDs, id)
+				}
 			}
 		}
+	}
+
+	if ss.judge0.CallbacksEnabled() {
+		refusedIDs := make([]string, 0)
+		for i, exec := range executions {
+			if i < len(results) && results[i].Error != nil {
+				if errors.Is(results[i].Error, judge0.ErrDispatchRejected) {
+					refusedIDs = append(refusedIDs, exec.ID)
+				}
+			}
+		}
+		failedIDs = refusedIDs
 	}
 
 	if len(failedIDs) > 0 {
@@ -190,6 +211,219 @@ func (ss *SubmissionService) CreateSubmission(ctx context.Context, userID string
 
 	return submissionID, nil
 
+}
+
+func (ss *SubmissionService) HandleJudge0Callback(ctx context.Context, executionID string, payload judge0.CallbackResult) error {
+	status, final := mapJudgeStatus(payload.Status.ID)
+	if !final {
+		if payload.Token == "" {
+			return fmt.Errorf("missing Judge0 token")
+		}
+		return ss.stores.Executions.SaveTokens(ctx, map[string]string{executionID: payload.Token})
+	}
+	runtime, err := judgeRuntimeMillis(payload.Time)
+	if err != nil {
+		return err
+	}
+	memory := int64(0)
+	if payload.Memory != nil {
+		memory = *payload.Memory
+	}
+	return ss.stores.Executions.ProcessFinal(ctx, stores.FinalExecutionResult{ExecutionID: executionID, Token: payload.Token, Status: status, Runtime: runtime, Memory: memory})
+}
+
+func mapJudgeStatus(id int) (string, bool) {
+	switch {
+	case id <= 2:
+		return "pending", false
+	case id == 3:
+		return "accepted", true
+	case id == 4:
+		return "wrong_answer", true
+	case id == 5:
+		return "tle", true
+	case id == 6:
+		return "failed_to_process", true
+	case id >= 7 && id <= 12:
+		return "rte", true
+	case id == 13 || id == 14:
+		return "judge_error", true
+	default:
+		return "", false
+	}
+}
+func judgeRuntimeMillis(raw json.RawMessage) (int64, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return 0, nil
+	}
+	var s string
+	if raw[0] == '"' {
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return 0, err
+		}
+	} else {
+		s = string(raw)
+	}
+	seconds, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, err
+	}
+	if seconds < 0 {
+		return 0, fmt.Errorf("negative Judge0 runtime")
+	}
+	return int64(seconds*1000 + 0.5), nil
+}
+
+func (ss *SubmissionService) RecoverJudge0(ctx context.Context) {
+	if !ss.cursorMu.TryLock() {
+		return
+	}
+	defer ss.cursorMu.Unlock()
+
+	if ss.stores.Submissions != nil {
+		orphans, orphanErr := ss.stores.Submissions.PendingCodeWithoutExecutions(ctx, time.Now().Unix()-10, 50)
+		if orphanErr != nil {
+			log.Errorf("judge0 recovery list unprepared submissions failed: %v", orphanErr)
+		} else {
+			for _, id := range orphans {
+				if err := ss.stores.Submissions.MarkFailed(ctx, id); err != nil {
+					log.Errorf("judge0 recovery fail unprepared submission %s: %v", id, err)
+				}
+			}
+		}
+	}
+
+	observedAt := time.Now()
+	workerCtx, cancelWorkers := context.WithTimeout(ctx, ss.judge0.Timeout())
+	idle, workerErr := ss.judge0.WorkersIdle(workerCtx)
+	cancelWorkers()
+	cutoff := int64(0)
+	if workerErr != nil || !idle {
+		ss.recoveryIdleSince = time.Time{}
+		if workerErr != nil {
+			log.Errorf("judge0 recovery worker observation failed: %v", workerErr)
+		}
+	} else if ss.recoveryIdleSince.IsZero() {
+		ss.recoveryIdleSince = observedAt
+	} else if observedAt.Sub(ss.recoveryIdleSince) >= 15*time.Second {
+		// shortcut: two idle sweeps plus a dispatch margin; revisit if Judge0 adds delayed retries.
+		cutoff = ss.recoveryIdleSince.Unix() - 30
+		ss.recoveryIdleSince = observedAt
+	}
+	if cutoff > 0 {
+		staleIDs, err := ss.stores.Executions.PendingTokenlessBefore(ctx, cutoff, 50)
+		if err != nil {
+			log.Errorf("judge0 recovery list abandoned tokenless failed: %v", err)
+		} else if len(staleIDs) > 0 {
+			if err := ss.stores.Executions.MarkFailed(ctx, staleIDs); err != nil {
+				log.Errorf("judge0 recovery cleanup abandoned tokenless failed: %v", err)
+			}
+		}
+	}
+
+	completed, err := ss.stores.Executions.TerminalPendingParents(ctx, 50)
+	if err != nil {
+		log.Errorf("judge0 recovery reconcile failed: %v", err)
+	} else {
+		for _, result := range completed {
+			if ctx.Err() != nil {
+				return
+			}
+			if e := ss.stores.Executions.ProcessFinal(ctx, result); e != nil {
+				log.Errorf("judge0 recovery reconcile result failed: %v", e)
+			}
+		}
+	}
+
+	for ctx.Err() == nil {
+		items, err := ss.stores.Executions.PendingWithTokens(ctx, 50, ss.recoveryCursorTime, ss.recoveryCursorID)
+		if err != nil {
+			log.Errorf("judge0 recovery list failed: %v", err)
+			return
+		}
+
+		if len(items) == 0 {
+			ss.recoveryCursorTime = 0
+			ss.recoveryCursorID = ""
+			return
+		}
+
+		for start := 0; start < len(items); start += ss.judge0.BatchSize() {
+			if ctx.Err() != nil {
+				log.Warnf("judge0 recovery context timeout, breaking early")
+				break
+			}
+			callCtx, cancel := context.WithTimeout(ctx, ss.judge0.Timeout())
+			end := min(start+ss.judge0.BatchSize(), len(items))
+			page := items[start:end]
+			tokens := make([]string, len(page))
+			for i, item := range page {
+				tokens[i] = item.Judge0Token
+			}
+			results, e := ss.judge0.GetSubmissions(callCtx, tokens)
+			cancel()
+			if e != nil {
+				// Failed batches advance so unavailable tokens cannot starve later jobs.
+				last := page[len(page)-1]
+				ss.recoveryCursorTime, ss.recoveryCursorID = last.CreatedAt, last.ID
+				log.Errorf("judge0 recovery result fetch failed: %v", e)
+				continue
+			}
+			for i, item := range page {
+				if ctx.Err() != nil {
+					return
+				}
+				ss.recoveryCursorTime, ss.recoveryCursorID = item.CreatedAt, item.ID
+				result := results[i]
+				if result == nil || (cutoff > 0 && item.CreatedAt < cutoff && result.Status.ID <= 2) {
+					if e = ss.stores.Executions.ProcessFinal(ctx, stores.FinalExecutionResult{ExecutionID: item.ID, Token: item.Judge0Token, Status: "judge_error"}); e != nil {
+						log.Errorf("judge0 recovery abandoned job finalization failed: %v", e)
+					}
+					continue
+				}
+				_, final := mapJudgeStatus(result.Status.ID)
+				if !final {
+					continue
+				}
+				payload := judge0.CallbackResult{Token: result.Token, Time: result.Time, Memory: result.Memory}
+				payload.Status.ID = result.Status.ID
+				if e = ss.HandleJudge0Callback(ctx, item.ID, payload); e != nil {
+					log.Errorf("judge0 recovery result failed: %v", e)
+				}
+			}
+		}
+	}
+}
+
+func NewJudge0Recovery(lc fx.Lifecycle, ss *SubmissionService) {
+	workerCtx, stop := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	lc.Append(fx.Hook{OnStart: func(context.Context) error {
+		go func() {
+			defer close(done)
+			ticker := time.NewTicker(15 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case <-ticker.C:
+					ctx, cancel := context.WithTimeout(workerCtx, 30*time.Second)
+					ss.RecoverJudge0(ctx)
+					cancel()
+				}
+			}
+		}()
+		return nil
+	}, OnStop: func(ctx context.Context) error {
+		stop()
+		select {
+		case <-done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}})
 }
 
 func (ss *SubmissionService) markSubmissionFailed(ctx context.Context, submissionID string, cause error) error {
