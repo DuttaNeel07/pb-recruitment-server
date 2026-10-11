@@ -14,6 +14,7 @@ import (
 type FinalExecutionResult struct {
 	ExecutionID, Token, Status string
 	Runtime, Memory            int64
+	CompileOutput, Stderr      string
 }
 type executionChild struct {
 	id, status    string
