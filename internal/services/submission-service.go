@@ -251,7 +251,22 @@ func judgeOutputText(raw json.RawMessage) string {
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return ""
 	}
-	return truncateJudgeOutput(s)
+	// Judge0 1.13.1 callbacks always Base64-encode output fields, and
+	// recovery now requests base64_encoded=true.  Attempt to decode;
+	// fall back to the literal string for plain-text values.
+	if decoded, err := base64.StdEncoding.DecodeString(s); err == nil {
+		s = string(decoded)
+	}
+	return truncateJudgeOutput(sanitizeJudgeOutput(s))
+}
+
+// sanitizeJudgeOutput replaces invalid UTF-8 sequences with U+FFFD and
+// strips NUL bytes that PostgreSQL TEXT columns reject (SQLSTATE 22021).
+func sanitizeJudgeOutput(s string) string {
+	if !utf8.ValidString(s) {
+		s = strings.ToValidUTF8(s, "\ufffd")
+	}
+	return strings.ReplaceAll(s, "\x00", "")
 }
 
 func truncateJudgeOutput(s string) string {
@@ -264,7 +279,6 @@ func truncateJudgeOutput(s string) string {
 	}
 	return s
 }
-
 
 func mapJudgeStatus(id int) (string, bool) {
 	switch {
