@@ -252,12 +252,13 @@ func judgeOutputText(raw json.RawMessage) string {
 		return ""
 	}
 	// Judge0 1.13.1 callbacks always Base64-encode output fields, and
-	// recovery now requests base64_encoded=true.  Attempt to decode;
-	// fall back to the literal string for plain-text values.
-	if decoded, err := base64.StdEncoding.DecodeString(s); err == nil {
-		s = string(decoded)
+	// recovery requests base64_encoded=true. Malformed data is discarded rather
+	// than treated as plain text, which could corrupt valid-looking Base64.
+	decoded, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return ""
 	}
-	return truncateJudgeOutput(sanitizeJudgeOutput(s))
+	return truncateJudgeOutput(sanitizeJudgeOutput(string(decoded)))
 }
 
 // sanitizeJudgeOutput replaces invalid UTF-8 sequences with U+FFFD and

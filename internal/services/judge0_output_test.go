@@ -18,13 +18,11 @@ func TestJudgeOutputTextDecodesBase64(t *testing.T) {
 	}
 }
 
-func TestJudgeOutputTextPlainFallback(t *testing.T) {
-	// Values that are not valid Base64 should pass through unchanged.
-	plain := "this is not base64!!"
-	raw, _ := json.Marshal(plain)
+func TestJudgeOutputTextDiscardsMalformedBase64(t *testing.T) {
+	raw, _ := json.Marshal("this is not base64!!")
 	got := judgeOutputText(json.RawMessage(raw))
-	if got != plain {
-		t.Errorf("judgeOutputText(plain) = %q, want %q", got, plain)
+	if got != "" {
+		t.Errorf("judgeOutputText(malformed base64) = %q, want empty", got)
 	}
 }
 
